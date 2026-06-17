@@ -52,8 +52,13 @@ system.l2cache = L2Cache()
 # Link L2 cache with L1 to L2 interconnect
 system.l2cache.cpu_side = system.l2bus.mem_side_ports
 
-# Create memory bus
-system.membus = SystemXBar()
+# Create memory bus (Hacked to simulate an Off-Chip CXL/PCIe Link)
+system.membus = SystemXBar(
+    frontend_latency=10,         # 10 cycles (5ns) to inject into the bus
+    forward_latency=100,         # 100 cycles (50ns) to travel up to the CPU
+    response_latency=100,        # 100 cycles (50ns) to travel back down
+    snoop_response_latency=100   # 100 cycles (50ns) for the CPU to send dirty data down
+)
 
 # Link L2 with interconnect
 system.l2cache.mem_side = system.membus.cpu_side_ports
@@ -98,7 +103,7 @@ root = Root(full_system = False, system = system)
 m5.instantiate()
 
 # Dedicate upper 1GB to NDP device
-system.cpu.workload[0].map(0x40000000, 0x40000000, 0x40000000, cacheable=False)
+system.cpu.workload[0].map(0x40000000, 0x40000000, 0x40000000, cacheable=True)
 
 print("========== Beginning simulation ==========")
 exit_event = m5.simulate()

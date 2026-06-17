@@ -24,7 +24,7 @@
 
 #define START_CODE 50
 
-#define DATA_SIZE 0x10000
+#define DATA_SIZE 0x100000
 #define MAX_KEY (DATA_SIZE / 4)
 
 #define GET_TICKS std::chrono::high_resolution_clock::now()

@@ -1,11 +1,11 @@
 CC=g++
 CCF=
 LDF=-static
-SRC_O0=main.cpp
+SRC_O0=coherence_bench.cpp
 SRC_O3=baseline.cpp
 SRC=$(SRC_O0) $(SRC_O3)
 OBJ=$(SRC:.cpp=.o)
-EXE=bench
+EXE=bench_se
 
 # Specify a different compiler
 ifeq ($(arch), arm)
