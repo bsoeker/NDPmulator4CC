@@ -45,10 +45,14 @@ void NDPDevA::writePI(uint64_t ridx, uint64_t data) {
   }
 }
 
-void NDPDevA::signal_completion() {
+void NDPDevA::signal_completion(uint64_t compute_cycles) {
+  // Total delay = The base pipeline flush/setup time (scaleFactor) +
+  // mathematical compute time
+  uint64_t total_cycles = scaleFactor + compute_cycles;
+
   schedule(new EventFunctionWrapper([this] { pi_stat_rgst = 1; },
                                     name() + ".writeBackResultsEvent", true),
-           clockEdge(Cycles(1 * scaleFactor)));
+           clockEdge(Cycles(total_cycles)));
 }
 
 // =======================================================================
@@ -71,9 +75,8 @@ void NDPDevA::process_fsm() {
   case 3: // Strided Access
   case 4: // Pointer Chasing
   case 5: // Read-Modify-Write (RMW)
-    // Kick off the first 64-byte cache line fetch
-    accessMemory(Addr(current_addr), sizeof(Node), false,
-                 (uint8_t *)&current_node_buffer);
+          // Kick off the first 64-byte cache line fetch
+    accessMemory(Addr(current_addr), 64, false, current_node_buffer);
     break;
 
   default:
@@ -85,8 +88,8 @@ void NDPDevA::process_fsm() {
 // CONTINUATION ENGINE: Handles incoming bus data and state transitions
 // =======================================================================
 void NDPDevA::recvData(Addr addr, uint8_t *data, size_t size) {
-  DPRINTF(NDPDevAMem, "NDPDevA received %s callback for %u bytes at %p\n",
-          data ? "READ" : "WRITE", size, addr);
+  DPRINTF(NDPDevAMem, "CALLBACK: Addr %p, NextAddr %p\n", addr,
+          ((Node *)data)->next_addr);
 
   switch (pi_cmmd_code) {
   // ---------------------------------------------------------------
@@ -95,50 +98,60 @@ void NDPDevA::recvData(Addr addr, uint8_t *data, size_t size) {
   case 0:
   case 1:
   case 2: {
-    uint64_t cycles = 0;
+    // 1. Execute the functional logic instantly on the host
     if (pi_cmmd_code == 0)
-      cycles = compare_n_hit(operands, pi_data_size, pi_data_skey);
+      compare_n_hit(operands, pi_data_size, pi_data_skey);
     else if (pi_cmmd_code == 1)
-      cycles = compare_n_count(operands, pi_data_size, pi_data_skey);
+      compare_n_count(operands, pi_data_size, pi_data_skey);
     else
-      cycles = compare_n_max(operands, pi_data_size);
+      compare_n_max(operands, pi_data_size);
 
     delete[] operands;
-    signal_completion();
+
+    // 2. The Analytical Delay Calculation
+    // Tune these parameters to match your target real-life hardware
+    uint64_t elements_per_cycle = 1; // Assuming a scalar 64-bit ALU
+    uint64_t pipeline_depth = 15; // Cycles to fill/drain the compute pipeline
+
+    // Calculate how long the hardware would physically take to process the
+    // array
+    uint64_t compute_cycles =
+        (pi_data_size / elements_per_cycle) + pipeline_depth;
+
+    // 3. Schedule the completion at the mathematically correct time in the
+    // future
+    signal_completion(compute_cycles);
     break;
   }
 
   // ---------------------------------------------------------------
   // CMD 3: Strided Access (Non-Contiguous Reads)
-  // pi_data_skey acts as the Stride Length (in bytes)
   // ---------------------------------------------------------------
   case 3: {
     current_depth++;
     if (current_depth >= pi_data_size) {
-      signal_completion();
+      signal_completion(
+          0); // Compute delay is hidden/interleaved with memory fetches
     } else {
-      current_addr += pi_data_skey; // Jump by stride
-      accessMemory(Addr(current_addr), sizeof(Node), false,
-                   (uint8_t *)&current_node_buffer);
+      current_addr += pi_data_skey;
+      accessMemory(Addr(current_addr), 64, false, current_node_buffer);
     }
     break;
   }
 
   // ---------------------------------------------------------------
   // CMD 4: Pointer Chasing (Dependent Reads)
-  // Data payload guides the next memory fetch
   // ---------------------------------------------------------------
   case 4: {
     current_depth++;
     Node *received = (Node *)data;
-    pi_last_rslt = received->payload; // Keep track of last visited payload
+    pi_last_rslt = received->payload;
 
     if (current_depth >= pi_data_size || received->next_addr == 0) {
-      signal_completion();
+      signal_completion(0);
     } else {
-      current_addr = received->next_addr; // True dependent lookup
-      accessMemory(Addr(current_addr), sizeof(Node), false,
-                   (uint8_t *)&current_node_buffer);
+      current_addr = received->next_addr;
+      accessMemory(Addr(current_addr), 64, false, current_node_buffer);
     }
     break;
   }
@@ -148,20 +161,16 @@ void NDPDevA::recvData(Addr addr, uint8_t *data, size_t size) {
   // ---------------------------------------------------------------
   case 5: {
     if (data != NULL) {
-      // Phase A: READ returned. Modify the payload, issue a WRITE.
       Node *received = (Node *)data;
-      received->payload += pi_data_skey; // Arbitrary work
-      accessMemory(addr, sizeof(Node), true,
-                   (uint8_t *)received); // Note: write=true
+      received->payload += pi_data_skey;
+      accessMemory(addr, sizeof(Node), true, (uint8_t *)received);
     } else {
-      // Phase B: WRITE ACK returned (data == NULL from ndp.cc). Step forward.
       current_depth++;
       if (current_depth >= pi_data_size) {
-        signal_completion();
+        signal_completion(0);
       } else {
-        current_addr += sizeof(Node); // Move to next contiguous cache line
-        accessMemory(Addr(current_addr), sizeof(Node), false,
-                     (uint8_t *)&current_node_buffer);
+        current_addr += sizeof(Node);
+        accessMemory(Addr(current_addr), 64, false, current_node_buffer);
       }
     }
     break;
@@ -176,10 +185,11 @@ void NDPDevA::recvData(Addr addr, uint8_t *data, size_t size) {
 uint64_t NDPDevA::compare_n_hit(uint64_t *data, uint64_t size, uint64_t skey) {
   for (uint64_t i = 0; i < size; ++i) {
     if (data[i] == skey) {
-      pi_last_rslt = 1;
+      pi_last_rslt = i;
       return i;
     }
   }
+  pi_last_rslt = size;
   return size;
 }
 

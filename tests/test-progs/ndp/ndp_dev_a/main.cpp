@@ -1,63 +1,54 @@
-#include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <string>
+#include <time.h>
 
-#ifdef FS
-#include <cassert>
-#include <fcntl.h>
-#include <sys/mman.h>
-#endif
-
-#if defined(FS) && defined(DRIVER)
-#include <unistd.h>
-#endif
-
-#include "baseline.h"
-
+// --- Memory Map & Hardware Macros ---
 #define NDP_CTRL 0x40000000
 #define NDP_DATA 0x40001000
-#define NDP_CSZE 0x1000
-#define NDP_TSZE 0x40000000
-#define FID_NAME "/dev/ndp_dev_a"
-#define WRI_SIZE 0x28
-#define REA_SIZE 0x10
-
-#define START_CODE 50
-
-// Size set to fit comfortably inside caches to avoid eviction panics
+#define NDP_NODES 0x40009000
 #define DATA_SIZE 0x1000
 #define MAX_KEY (DATA_SIZE / 4)
+#define START_CODE 50
 
-#define GET_TICKS std::chrono::high_resolution_clock::now()
-#define GET_ELAPS(A, B)                                                        \
-  std::chrono::duration_cast<std::chrono::nanoseconds>(B - A).count()
+// --- Data Structures ---
+struct Node {
+  uint64_t payload;
+  uint64_t next_addr;
+  uint8_t padding[48]; // Force the struct to be exactly 64 bytes
+};
+
+// --- gem5 SE-Mode Safe Timing ---
+// Uses the simulated process clock, avoiding assembly assertion crashes
+inline uint64_t read_sim_ticks() {
+  struct timespec ts;
+  clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+// --- Software Baselines ---
+uint64_t sw_compare_n_hit(uint64_t *data, uint64_t size, uint64_t skey) {
+  for (uint64_t i = 0; i < size; ++i) {
+    if (data[i] == skey)
+      return i;
+  }
+  return size;
+}
 
 int main(int argc, char *argv[]) {
-  setbuf(stdout, NULL); // Flush stdout immediately
+  setbuf(stdout, NULL);
 
+  bool run_isolated = false;
+  // if (argc > 1 && std::string(argv[1]) == "--isolated") {
+  //   run_isolated = true;
+  // }
+
+  // Hardware Interface Pointers
   uint64_t *ndp_ctrl = (uint64_t *)NDP_CTRL;
   uint64_t *ndp_data = (uint64_t *)NDP_DATA;
-
-  // Initialize data for legacy queries
-  for (int i = 0; i < DATA_SIZE; ++i) {
-    ndp_data[i] = rand() % MAX_KEY;
-  }
-  ndp_data[0] = MAX_KEY + 1;
-  ndp_data[DATA_SIZE / 2] = MAX_KEY + 2;
-  ndp_data[DATA_SIZE - 1] = MAX_KEY + 3;
-
-  // Initialize Linked List Nodes for Pointer Chasing
-  Node *ndp_nodes = (Node *)ndp_data;
-  uint64_t num_nodes = (DATA_SIZE * sizeof(uint64_t)) / sizeof(Node);
-
-  for (uint64_t i = 0; i < num_nodes; i++) {
-    ndp_nodes[i].payload = i * 100;
-    if (i < num_nodes - 1) {
-      ndp_nodes[i].next_addr = NDP_DATA + (i + 1) * sizeof(Node);
-    } else {
-      ndp_nodes[i].next_addr = 0;
-    }
-  }
+  volatile Node *ndp_nodes = (volatile Node *)NDP_NODES;
 
   uint64_t &pi_addr_data = ndp_ctrl[0];
   uint64_t &pi_data_size = ndp_ctrl[1];
@@ -67,96 +58,89 @@ int main(int argc, char *argv[]) {
   uint64_t &pi_stat_rgst = ndp_ctrl[5];
   uint64_t &pi_last_rslt = ndp_ctrl[6];
 
-  std::cout << "========== WORKLOAD STARTED ========" << std::endl;
+  std::cout << "\n========== NDP ACCELERATOR MICROBENCHMARK =========="
+            << std::endl;
+  std::cout << "Mode: "
+            << (run_isolated ? "ISOLATED (Cold/Untouched)"
+                             : "SHARED (CPU Cached/Coherent)")
+            << std::endl;
 
-  /* ============================== Hit_TSC_Best ==============================
-   */
-  auto start_sw = GET_TICKS;
-  uint64_t res_sw = compare_n_hit(ndp_data, DATA_SIZE, MAX_KEY + 1);
-  auto end_sw = GET_TICKS;
+  uint64_t num_nodes = (DATA_SIZE * sizeof(uint64_t)) / sizeof(Node);
 
-  auto start_hw = GET_TICKS;
+  // =======================================================================
+  // PHASE 1: CPU Memory Initialization (Only if Shared)
+  // =======================================================================
+  if (!run_isolated) {
+    // Init Bulk Array
+    for (int i = 0; i < DATA_SIZE; ++i) {
+      ndp_data[i] = rand() % MAX_KEY;
+    }
+    ndp_data[DATA_SIZE / 2] = MAX_KEY + 1; // Guarantee a hit
+
+    // Init Pointer Chasing Linked List (Overlays on same memory)
+    for (uint64_t i = 0; i < num_nodes; i++) {
+      ndp_nodes[i].payload = i * 100;
+      ndp_nodes[i].next_addr =
+          (i < num_nodes - 1) ? NDP_NODES + (i + 1) * sizeof(Node) : 0;
+    }
+  }
+
+  // =======================================================================
+  // PHASE 2: Test Bulk Processing (Compute-Bound, Pipelined)
+  // Command 0: Compare-N-Hit
+  // =======================================================================
+  std::cout << "\n[TEST 1] Bulk Processing (Cmd 0: Compare-N-Hit)" << std::endl;
+
+  uint64_t start_sw_bulk = 0, end_sw_bulk = 0, res_sw_bulk = 0;
+  if (!run_isolated) {
+    start_sw_bulk = read_sim_ticks();
+    res_sw_bulk = sw_compare_n_hit(ndp_data, DATA_SIZE, MAX_KEY + 1);
+    end_sw_bulk = read_sim_ticks();
+  }
+
+  uint64_t start_hw_bulk = read_sim_ticks();
   pi_addr_data = NDP_DATA;
-  pi_data_size = 0x1;
+  pi_data_size = DATA_SIZE;
   pi_data_skey = MAX_KEY + 1;
   pi_cmmd_code = 0;
   pi_strt_rgst = START_CODE;
 
   while (!pi_stat_rgst)
-    ;
+    ; // Spin wait
 
-  uint64_t res_hw = pi_last_rslt;
-  auto end_hw = GET_TICKS;
+  uint64_t end_hw_bulk = read_sim_ticks();
+  uint64_t res_hw_bulk = pi_last_rslt;
 
-  printf("[%s] Hit_TSC_Best:  sw: %6lu ns, hw: %6lu ns (norm: %2.3f)\n",
-         res_sw == res_hw ? "PASS" : "FAIL", GET_ELAPS(start_sw, end_sw),
-         GET_ELAPS(start_hw, end_hw),
-         1.0 * GET_ELAPS(start_hw, end_hw) / GET_ELAPS(start_sw, end_sw));
+  if (run_isolated) {
+    printf("  -> HW Ticks: %lu\n", end_hw_bulk - start_hw_bulk);
+  } else {
+    printf("  -> SW Ticks: %lu | HW Ticks: %lu | Match: %s\n",
+           end_sw_bulk - start_sw_bulk, end_hw_bulk - start_hw_bulk,
+           (res_sw_bulk == res_hw_bulk) ? "PASS" : "FAIL");
+  }
 
-  /* ============================== Strided_TSC ==============================
-   */
-  // uint64_t stride_bytes = 128;
-  // uint64_t strided_elements = DATA_SIZE / (stride_bytes / sizeof(uint64_t));
-  //
-  // auto start_sw = GET_TICKS;
-  // auto res_sw = strided_access(ndp_data, strided_elements, stride_bytes);
-  // auto end_sw = GET_TICKS;
-  //
-  // auto start_hw = GET_TICKS;
-  // pi_addr_data = NDP_DATA;
-  // pi_data_size = strided_elements;
-  // pi_data_skey = stride_bytes;
-  // pi_cmmd_code = 3;
-  // pi_strt_rgst = START_CODE;
-  // while (!pi_stat_rgst)
-  //   ;
-  // auto res_hw = pi_last_rslt;
-  // auto end_hw = GET_TICKS;
-  //
-  // printf("[%s] Strided_TSC:     sw: %6lu ns, hw: %6lu ns (norm: %2.3f)\n",
-  //        res_sw == res_hw ? "PASS" : "FAIL", GET_ELAPS(start_sw, end_sw),
-  //        GET_ELAPS(start_hw, end_hw),
-  //        1.0 * GET_ELAPS(start_hw, end_hw) / GET_ELAPS(start_sw, end_sw));
+  // =======================================================================
+  // PHASE 3: Test Pointer Chasing (Latency-Bound, Serialized)
+  // Command 4: Linked List Traversal
+  // =======================================================================
+  std::cout << "\n[TEST 2] Pointer Chasing (Cmd 4: Dependent Reads)"
+            << std::endl;
 
-  /* =========================== PointerChase_TSC ============================
-   */
-  // auto start_sw = GET_TICKS;
-  // auto res_sw = pointer_chase(ndp_nodes, num_nodes, NDP_DATA);
-  // auto end_sw = GET_TICKS;
-  //
-  // // ---------------------------------------------------------
-  // // RUN 1: The Coherency Penalty (M -> S Downgrade)
-  // // ---------------------------------------------------------
-  // auto start_hw = GET_TICKS;
-  // pi_addr_data = NDP_DATA;
-  // pi_data_size = num_nodes;
-  // pi_cmmd_code = 4;
-  // pi_strt_rgst = START_CODE;
-  // while (!pi_stat_rgst)
-  //   ;
-  // auto res_hw = pi_last_rslt;
-  // auto end_hw = GET_TICKS;
-  //
-  // printf("[%s] PntrChase (Dirty): sw: %6lu ns, hw: %6lu ns (norm: %2.3f)\n",
-  //        res_sw == res_hw ? "PASS" : "FAIL", GET_ELAPS(start_sw, end_sw),
-  //        GET_ELAPS(start_hw, end_hw),
-  //        1.0 * GET_ELAPS(start_hw, end_hw) / GET_ELAPS(start_sw, end_sw));
+  uint64_t start_hw_chase = read_sim_ticks();
+  pi_addr_data = NDP_NODES;
+  pi_data_size = num_nodes;
+  pi_data_skey = 0;
+  pi_cmmd_code = 4;
+  pi_strt_rgst = START_CODE;
 
-  // ---------------------------------------------------------
-  // RUN 2: The Isolated Baseline (Clean Read, No Snoops)
-  // ---------------------------------------------------------
-  // auto start_hw_clean = GET_TICKS;
-  // pi_addr_data = NDP_DATA;
-  // pi_data_size = num_nodes;
-  // pi_cmmd_code = 4;
-  // pi_strt_rgst = START_CODE;
-  // while (!pi_stat_rgst)
-  //   ;
-  //
-  // auto end_hw_clean = GET_TICKS;
-  //
-  // printf("[PASS] PntrChase (Clean):               hw: %6lu ns\n",
-  //        GET_ELAPS(start_hw_clean, end_hw_clean));
+  while (!pi_stat_rgst)
+    ; // Spin wait
+
+  uint64_t end_hw_chase = read_sim_ticks();
+
+  printf("  -> HW Ticks: %lu\n", end_hw_chase - start_hw_chase);
+  std::cout << "====================================================\n"
+            << std::endl;
 
   return 0;
 }

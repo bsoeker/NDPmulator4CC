@@ -42,7 +42,6 @@ system.cpu.dcache.cpu_side = system.ndp_accel.mem_side
 
 # Create L1 to L2 interconnect
 system.l2bus = L2XBar()
-system.l2bus.snoop_filter = NULL
 
 # Link L1 with interconnect
 system.cpu.icache.mem_side = system.l2bus.cpu_side_ports
@@ -61,7 +60,7 @@ system.membus = SystemXBar()
 system.l2cache.mem_side = system.membus.cpu_side_ports
 
 # Connect NDP device to L2
-system.ndp_accel.dma_port = system.l2bus.cpu_side_ports
+system.ndp_accel.dma_port = system.membus.cpu_side_ports
 
 # Create interrupt controller
 system.cpu.createInterruptController()

@@ -31,7 +31,7 @@ private:
     uint8_t padding[48]; // Pad out to exactly 64 bytes (1 cache line)
   };
 
-  Node current_node_buffer; // 64-byte buffer for single-line fetches
+  uint8_t current_node_buffer[64];
   uint64_t current_depth = 0;
   uint64_t current_addr = 0;
 
@@ -42,7 +42,7 @@ private:
 
   // Core state machine functions
   void process_fsm();
-  void signal_completion();
+  void signal_completion(uint64_t compute_cycles = 0);
 
 public:
   NDPDevA(const NDPDevAParams &params);

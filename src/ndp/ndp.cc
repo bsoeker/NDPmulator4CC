@@ -10,6 +10,7 @@ NDP::NDP(const NDPParams &params)
       maxReqs(params.max_reqs) {
   flyReqs = 0;
   dmaActv = false;
+  requestorId = params.system->getRequestorId(this);
 }
 
 Port &NDP::getPort(const std::string &if_name, PortID idx) {
@@ -125,10 +126,8 @@ void NDP::accessMemory(Addr addr, size_t size, bool write, uint8_t *data) {
     newRequest->addSubRequest(AddrRange(saddr, saddr + ssize), sdata);
 
     PacketPtr pkt =
-        new Packet(std::make_shared<Request>( // Create request
-                       saddr, ssize, 0, 0),
-                   write ? MemCmd::WriteReq : MemCmd::ReadReq, // Read or write
-                   ssize);
+        new Packet(std::make_shared<Request>(saddr, ssize, 0, requestorId),
+                   write ? MemCmd::WriteReq : MemCmd::ReadReq, ssize);
 
     // Allocate and initialize packet buffer
     uint8_t *sdataBuffer = new uint8_t[ssize];
