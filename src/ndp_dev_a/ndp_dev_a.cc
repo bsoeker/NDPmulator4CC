@@ -79,6 +79,21 @@ void NDPDevA::process_fsm() {
     accessMemory(Addr(current_addr), 64, false, current_node_buffer);
     break;
 
+  case 6: { // Seed pointer-chase list functionally, via DMA (no CPU cache
+            // touch). Used to give ISOLATED mode a real chain to walk
+            // without ever routing the write through the CPU's ports.
+    uint64_t n = pi_data_size;
+    seedBuffer = new uint8_t[n * sizeof(Node)];
+    Node *nodes = (Node *)seedBuffer;
+    for (uint64_t i = 0; i < n; i++) {
+      nodes[i].payload = i * 100;
+      nodes[i].next_addr =
+          (i < n - 1) ? pi_addr_data + (i + 1) * sizeof(Node) : 0;
+    }
+    accessMemory(Addr(pi_addr_data), n * sizeof(Node), true, seedBuffer);
+    break;
+  }
+
   default:
     panic("Invalid command was issued to NDPDevA!\n");
   }
@@ -88,8 +103,7 @@ void NDPDevA::process_fsm() {
 // CONTINUATION ENGINE: Handles incoming bus data and state transitions
 // =======================================================================
 void NDPDevA::recvData(Addr addr, uint8_t *data, size_t size) {
-  DPRINTF(NDPDevAMem, "CALLBACK: Addr %p, NextAddr %p\n", addr,
-          ((Node *)data)->next_addr);
+  DPRINTF(NDPDevAMem, "CALLBACK: Addr %p, size %lu\n", addr, size);
 
   switch (pi_cmmd_code) {
   // ---------------------------------------------------------------
@@ -173,6 +187,16 @@ void NDPDevA::recvData(Addr addr, uint8_t *data, size_t size) {
         accessMemory(Addr(current_addr), 64, false, current_node_buffer);
       }
     }
+    break;
+  }
+
+  // ---------------------------------------------------------------
+  // CMD 6: List-Seeding DMA Write Completion
+  // ---------------------------------------------------------------
+  case 6: {
+    delete[] seedBuffer;
+    seedBuffer = nullptr;
+    signal_completion(0);
     break;
   }
 

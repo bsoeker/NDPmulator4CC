@@ -24,16 +24,20 @@ private:
   bool has_operands = false;
   uint64_t *operands;
 
-  // --- NEW: State Tracking for Demand-Driven Workloads ---
+  // --- State Tracking for Demand-Driven Workloads ---
   struct Node {
-    uint64_t next_addr;  // Physical address of next node
     uint64_t payload;    // Data payload
+    uint64_t next_addr;  // Physical address of next node
     uint8_t padding[48]; // Pad out to exactly 64 bytes (1 cache line)
   };
 
   uint8_t current_node_buffer[64];
   uint64_t current_depth = 0;
   uint64_t current_addr = 0;
+
+  // Functional list-seeding buffer (cmd 6, isolated-mode init; freed on
+  // completion in recvData)
+  uint8_t *seedBuffer = nullptr;
 
   // Legacy baseline algorithms
   uint64_t compare_n_hit(uint64_t *data, uint64_t size, uint64_t skey);

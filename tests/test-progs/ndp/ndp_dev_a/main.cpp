@@ -40,10 +40,8 @@ uint64_t sw_compare_n_hit(uint64_t *data, uint64_t size, uint64_t skey) {
 int main(int argc, char *argv[]) {
   setbuf(stdout, NULL);
 
-  bool run_isolated = false;
-  // if (argc > 1 && std::string(argv[1]) == "--isolated") {
-  //   run_isolated = true;
-  // }
+  // Toggled by hand between runs: false == SHARED, true == ISOLATED
+  bool run_isolated = true;
 
   // Hardware Interface Pointers
   uint64_t *ndp_ctrl = (uint64_t *)NDP_CTRL;
@@ -120,11 +118,57 @@ int main(int argc, char *argv[]) {
   }
 
   // =======================================================================
+  // PHASE 2.5: Test Strided Access (Memory-Bound, Independent Reads)
+  // Command 3: Non-Contiguous Reads
+  // =======================================================================
+  std::cout << "\n[TEST 2] Strided Access (Cmd 3: Non-Contiguous Reads)"
+            << std::endl;
+
+  // Stride/count chosen to keep the total footprint (200 * 128B = 25600B)
+  // comfortably inside NDP_DATA (which spans 0x40001000..0x40009000) and
+  // clear of NDP_NODES. No SHARED/ISOLATED-specific setup needed here:
+  // pi_data_skey is reused as the byte stride, cmd 3's termination in
+  // NDPDevA::recvData is a pure depth counter (current_depth >=
+  // pi_data_size), and it never inspects the fetched bytes -- so it
+  // correctly inherits whatever coherency state Phase 1 already
+  // established for this range in each mode, with no extra seeding.
+  const uint64_t stride_bytes = 128;
+  const uint64_t stride_count = 200;
+
+  uint64_t start_hw_stride = read_sim_ticks();
+  pi_addr_data = NDP_DATA;
+  pi_data_size = stride_count;
+  pi_data_skey = stride_bytes; // repurposed as stride step for cmd 3
+  pi_cmmd_code = 3;
+  pi_strt_rgst = START_CODE;
+
+  while (!pi_stat_rgst)
+    ; // Spin wait
+
+  uint64_t end_hw_stride = read_sim_ticks();
+
+  printf("  -> HW Ticks: %lu\n", end_hw_stride - start_hw_stride);
+
+  // =======================================================================
   // PHASE 3: Test Pointer Chasing (Latency-Bound, Serialized)
   // Command 4: Linked List Traversal
   // =======================================================================
-  std::cout << "\n[TEST 2] Pointer Chasing (Cmd 4: Dependent Reads)"
+  std::cout << "\n[TEST 3] Pointer Chasing (Cmd 4: Dependent Reads)"
             << std::endl;
+
+  if (run_isolated) {
+    // Seed the list via the NDP device's own DMA path (cmd 6) instead of
+    // the CPU. This keeps the region genuinely untouched by the CPU cache
+    // hierarchy while still giving the device a real chain to walk.
+    // Untimed on purpose -- symmetric with Phase 1's CPU-side init being
+    // untimed in SHARED mode.
+    pi_addr_data = NDP_NODES;
+    pi_data_size = num_nodes;
+    pi_cmmd_code = 6;
+    pi_strt_rgst = START_CODE;
+    while (!pi_stat_rgst)
+      ; // Spin wait
+  }
 
   uint64_t start_hw_chase = read_sim_ticks();
   pi_addr_data = NDP_NODES;
@@ -137,8 +181,16 @@ int main(int argc, char *argv[]) {
     ; // Spin wait
 
   uint64_t end_hw_chase = read_sim_ticks();
+  uint64_t res_hw_chase = pi_last_rslt;
 
   printf("  -> HW Ticks: %lu\n", end_hw_chase - start_hw_chase);
+  // Verification print: should read (num_nodes - 1) * 100 = %lu if the
+  // full chain was actually walked. If this reads 0 (or anything other
+  // than the expected value), the traversal terminated early -- check
+  // that the chain was seeded correctly for the current mode.
+  printf("  -> Last Payload: %lu (expected: %lu)\n", res_hw_chase,
+         (num_nodes - 1) * 100);
+
   std::cout << "====================================================\n"
             << std::endl;
 
