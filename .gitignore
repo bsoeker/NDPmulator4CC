@@ -35,3 +35,4 @@ configs/dram/lowp_sweep.cfg
 __pycache__
 /fs_files
 /env
+results/
