@@ -9,7 +9,7 @@
 #define NDP_CTRL 0x40000000
 #define NDP_DATA 0x40001000
 #define NDP_NODES 0x40009000
-#define DATA_SIZE 0x400
+#define DATA_SIZE 0x1000
 #define MAX_KEY (DATA_SIZE / 4)
 #define START_CODE 50
 
@@ -38,20 +38,24 @@ uint64_t sw_compare_n_hit(uint64_t *data, uint64_t size, uint64_t skey) {
 
 // =========================================================================
 // HAND-TOGGLED CONFIG -- edit these, recompile, run, save stats.txt, repeat.
-// 3 tests x 3 share modes = 9 runs for the full dirty/clean/isolated sweep.
 // =========================================================================
-enum TestSelect { TEST_BULK = 1, TEST_STRIDED = 2, TEST_CHASE = 3 };
+enum TestSelect {
+  TEST_BULK = 1,
+  TEST_STRIDED = 2,
+  TEST_CHASE = 3,
+  TEST_RMW = 4
+};
 enum ShareMode {
   MODE_DIRTY = 0,   // CPU writes the data -> line ends up Modified
   MODE_CLEAN = 1,   // CPU only reads the data -> line ends up Shared
   MODE_ISOLATED = 2 // CPU never touches the data at all
 };
 
-static const ShareMode share_mode = MODE_CLEAN;
-static const TestSelect test_select = TEST_BULK;
-static const bool run_sw_baseline = false; // CLEAN meaningful in MODE_DIRTY +
-                                           //  TEST_BULK; ignored otherwise.
-                                           //  Leave false for stats.txt runs.
+static const ShareMode share_mode = MODE_ISOLATED;
+static const TestSelect test_select = TEST_RMW;
+static const bool run_sw_baseline = false; // only meaningful in MODE_DIRTY +
+                                           // TEST_BULK; ignored otherwise.
+                                           // Leave false for stats.txt runs.
 // =========================================================================
 
 int main(int argc, char *argv[]) {
@@ -73,10 +77,11 @@ int main(int argc, char *argv[]) {
       share_mode == MODE_DIRTY   ? "DIRTY (CPU-Written, Modified state)"
       : share_mode == MODE_CLEAN ? "CLEAN (CPU-Read-Only, Shared state)"
                                  : "ISOLATED (Cold/Untouched)";
-  const char *test_name = test_select == TEST_BULK ? "Bulk (Cmd 0)"
-                          : test_select == TEST_STRIDED
-                              ? "Strided (Cmd 3)"
-                              : "Pointer Chase (Cmd 4)";
+  const char *test_name = test_select == TEST_BULK      ? "Bulk (Cmd 0)"
+                          : test_select == TEST_STRIDED ? "Strided (Cmd 3)"
+                          : test_select == TEST_CHASE
+                              ? "Pointer Chase (Cmd 4)"
+                              : "Read-Modify-Write (Cmd 5)";
 
   std::cout << "\n========== NDP ACCELERATOR MICROBENCHMARK =========="
             << std::endl;
@@ -88,7 +93,7 @@ int main(int argc, char *argv[]) {
   // =======================================================================
   // PHASE 1: Untimed setup -- establishes the cache-residency state that
   // the timed test below will observe. Only initializes what the selected
-  // test actually needs.
+  // test actually needs. CHASE and RMW share the same Node-array setup.
   // =======================================================================
   volatile uint64_t touch_sink = 0; // prevents the compiler from eliding
                                     // the CLEAN-mode read-only sweeps below
@@ -100,7 +105,7 @@ int main(int argc, char *argv[]) {
       }
       ndp_data[DATA_SIZE / 2] = MAX_KEY + 1; // Guarantee a hit (bulk only)
     }
-    if (test_select == TEST_CHASE) {
+    if (test_select == TEST_CHASE || test_select == TEST_RMW) {
       for (uint64_t i = 0; i < num_nodes; i++) {
         ndp_nodes[i].payload = i * 100;
         ndp_nodes[i].next_addr =
@@ -108,7 +113,7 @@ int main(int argc, char *argv[]) {
       }
     }
   } else if (share_mode == MODE_CLEAN) {
-    if (test_select == TEST_CHASE) {
+    if (test_select == TEST_CHASE || test_select == TEST_RMW) {
       // Seed the real chain via NDP's own DMA path (cmd 6) -- CPU must NOT
       // be the one to write this data, or the line ends up Modified
       // instead of Shared once the CPU reads it below.
@@ -121,23 +126,24 @@ int main(int argc, char *argv[]) {
     }
 
     // CPU touches the data with reads only -- pulls lines into cache as
-    // Shared, never Modified. This is the one variable that differs from
-    // MODE_DIRTY: same end state (data cache-resident), different MOESI
-    // state, so any tick difference between DIRTY and CLEAN on the same
-    // test isolates the dirty-line-handling cost specifically.
+    // Shared, never Modified.
     if (test_select == TEST_BULK || test_select == TEST_STRIDED) {
       for (int i = 0; i < DATA_SIZE; ++i) {
         touch_sink = ndp_data[i];
       }
     }
-    if (test_select == TEST_CHASE) {
+    if (test_select == TEST_CHASE || test_select == TEST_RMW) {
       for (uint64_t i = 0; i < num_nodes; i++) {
         touch_sink = ndp_nodes[i].payload;
       }
     }
   }
   // MODE_ISOLATED: no Phase 1 setup at all. TEST_CHASE seeds its chain
-  // immediately before its own timed section below, same as before.
+  // immediately before its own timed section below (data-dependent
+  // termination requires real data). TEST_RMW's termination is a pure
+  // counter, so it doesn't need seeding even in ISOLATED mode -- its
+  // correctness check below accounts for starting from a zero-filled
+  // array in that case.
 
   // =======================================================================
   // TEST: Bulk Processing (Cmd 0)
@@ -233,6 +239,39 @@ int main(int argc, char *argv[]) {
     printf("  -> HW Ticks: %lu\n", end_hw - start_hw);
     printf("  -> Last Payload: %lu (expected: %lu)\n", res_hw,
            (num_nodes - 1) * 100);
+  }
+
+  // =======================================================================
+  // TEST: Read-Modify-Write (Cmd 5)
+  // =======================================================================
+  if (test_select == TEST_RMW) {
+    std::cout << "\n[TEST] Read-Modify-Write (Cmd 5: Invalidation Traffic)"
+              << std::endl;
+
+    const uint64_t addend = 1;
+
+    uint64_t start_hw = read_sim_ticks();
+    pi_addr_data = NDP_NODES;
+    pi_data_size = num_nodes;
+    pi_data_skey = addend; // repurposed as the RMW addend for cmd 5
+    pi_cmmd_code = 5;
+    pi_strt_rgst = START_CODE;
+
+    while (!pi_stat_rgst)
+      ; // Spin wait
+
+    uint64_t end_hw = read_sim_ticks();
+    printf("  -> HW Ticks: %lu\n", end_hw - start_hw);
+
+    // cmd 5 doesn't populate pi_last_rslt, so verify correctness directly
+    // via a plain CPU read of the last node's payload. This happens after
+    // the timed window closes, so it can't pollute the measurement.
+    uint64_t expected = (share_mode == MODE_ISOLATED)
+                            ? addend // array was never seeded -> started
+                                     // at 0, so final payload == addend
+                            : (num_nodes - 1) * 100 + addend;
+    uint64_t actual = ndp_nodes[num_nodes - 1].payload;
+    printf("  -> Last Node Payload: %lu (expected: %lu)\n", actual, expected);
   }
 
   std::cout << "====================================================\n"

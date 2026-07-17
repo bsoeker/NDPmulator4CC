@@ -125,9 +125,38 @@ void NDP::accessMemory(Addr addr, size_t size, bool write, uint8_t *data) {
     // Add sub request to pending list
     newRequest->addSubRequest(AddrRange(saddr, saddr + ssize), sdata);
 
+    // KNOWN LIMITATION: writes use WriteLineReq (a coherence-aware,
+    // whole-line-overwrite command -- appropriate since every NDP write
+    // here is exactly one cache line). This works correctly when the
+    // target address is not currently cached by any peer. It does NOT
+    // work when a peer cache holds the line -- dirty (Modified) or clean
+    // (Shared/Exclusive) -- because NDP has no cache of its own and
+    // cannot issue a proper invalidate-before-write transaction the way
+    // a real coherence participant would. gem5 correctly refuses this
+    // rather than producing wrong results:
+    //   - Modified peer copy -> panics in Cache::handleSnoop
+    //     (panic_if(!invalidate && !pkt->hasSharers(), ...))
+    //   - Clean peer copy    -> panics in SnoopFilter::lookupSnoop
+    //     (assert requires isWriteback() || isUncacheable() ||
+    //      (isInvalidate() == needsWritable()) || isCacheMaintenance())
+    // Marking the request uncacheable was tried as a workaround: it
+    // silences both panics, but does so by skipping the invalidating
+    // snoop broadcast entirely -- the peer cache never learns its copy
+    // is stale, and subsequent reads from that cache silently return
+    // pre-write data. Confirmed via main.cpp's post-test payload
+    // read-back returning the stale (pre-RMW) value. That workaround
+    // was rejected: a silent wrong answer is worse than a loud crash for
+    // a benchmark whose output feeds directly into correctness-sensitive
+    // conclusions. DO NOT reintroduce Request::UNCACHEABLE here without
+    // re-verifying against a real correctness check, not just "did it
+    // avoid crashing."
+    // Net effect: NDP's write-capable workloads (cmd 5, cmd 6) are only
+    // valid against addresses no peer cache currently holds. In the
+    // DIRTY/CLEAN/ISOLATED share_mode sweep, this means write workloads
+    // are only meaningfully testable in MODE_ISOLATED.
     PacketPtr pkt =
         new Packet(std::make_shared<Request>(saddr, ssize, 0, requestorId),
-                   write ? MemCmd::WriteReq : MemCmd::ReadReq, ssize);
+                   write ? MemCmd::WriteLineReq : MemCmd::ReadReq, ssize);
 
     // Allocate and initialize packet buffer
     uint8_t *sdataBuffer = new uint8_t[ssize];
