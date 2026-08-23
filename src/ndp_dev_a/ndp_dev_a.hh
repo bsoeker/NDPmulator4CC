@@ -20,11 +20,11 @@ private:
   uint64_t pi_stat_rgst = 1;
   uint64_t pi_last_rslt = 0;
 
-  // Bulk execution tracking
+  // Bulk execution tracking (cmd 0)
   bool has_operands = false;
   uint64_t *operands;
 
-  // --- State Tracking for Demand-Driven Workloads ---
+  // --- State Tracking for Demand-Driven Workloads (cmd 3/4/5) ---
   struct Node {
     uint64_t payload;    // Data payload
     uint64_t next_addr;  // Physical address of next node
@@ -35,14 +35,26 @@ private:
   uint64_t current_depth = 0;
   uint64_t current_addr = 0;
 
-  // Functional list-seeding buffer (cmd 6, isolated-mode init; freed on
-  // completion in recvData)
+  // Functional list-seeding buffer (cmd 6/9, CLEAN/ISOLATED-mode init;
+  // freed on completion in recvData). Reused across both since they
+  // never run concurrently within one test invocation.
   uint8_t *seedBuffer = nullptr;
 
-  // Legacy baseline algorithms
+  // --- Tree Traversal (cmd 8/9) ---
+  // Array-layout complete binary tree: node i's children live at 2i+1,
+  // 2i+2.
+  struct TreeNode {
+    uint64_t payload;
+    uint64_t left_addr;
+    uint64_t right_addr;
+    uint8_t padding[40]; // 8+8+8+40 = 64 bytes
+  };
+
+  uint64_t treeVisited = 0;
+  uint64_t treeTarget = 0;
+
+  // Legacy baseline algorithm (cmd 0)
   uint64_t compare_n_hit(uint64_t *data, uint64_t size, uint64_t skey);
-  uint64_t compare_n_count(uint64_t *data, uint64_t size, uint64_t skey);
-  uint64_t compare_n_max(uint64_t *data, uint64_t size);
 
   // Core state machine functions
   void process_fsm();

@@ -1,4 +1,5 @@
 build
+results/
 parser.out
 parsetab.py
 cscope.files
@@ -35,5 +36,4 @@ configs/dram/lowp_sweep.cfg
 __pycache__
 /fs_files
 /env
-results/
 m5out*

@@ -65,8 +65,6 @@ void NDPDevA::process_fsm() {
 
   switch (pi_cmmd_code) {
   case 0: // Compare-Hit (Bulk)
-  case 1: // Compare-Count (Bulk)
-  case 2: // Compare-Max (Bulk)
     operands = new uint64_t[pi_data_size];
     accessMemory(Addr(pi_addr_data), pi_data_size * sizeof(uint64_t), false,
                  (uint8_t *)operands);
@@ -80,8 +78,9 @@ void NDPDevA::process_fsm() {
     break;
 
   case 6: { // Seed pointer-chase list functionally, via DMA (no CPU cache
-            // touch). Used to give ISOLATED mode a real chain to walk
-            // without ever routing the write through the CPU's ports.
+            // touch). Used to give ISOLATED/CLEAN mode a real chain to
+            // walk without ever routing the write through the CPU's
+            // ports.
     uint64_t n = pi_data_size;
     seedBuffer = new uint8_t[n * sizeof(Node)];
     Node *nodes = (Node *)seedBuffer;
@@ -91,6 +90,39 @@ void NDPDevA::process_fsm() {
           (i < n - 1) ? pi_addr_data + (i + 1) * sizeof(Node) : 0;
     }
     accessMemory(Addr(pi_addr_data), n * sizeof(Node), true, seedBuffer);
+    break;
+  }
+
+  case 8: { // Tree Traversal: fan-out read starting at the root.
+            // pi_data_size holds the tree depth; treeTarget is the total
+            // node count of a complete binary tree at that depth.
+            // Termination is natural (a complete tree issues exactly
+            // treeTarget reads total).
+    treeVisited = 0;
+    treeTarget = (1ULL << (pi_data_size + 1)) - 1;
+    uint8_t *rootBuf = new uint8_t[64];
+    accessMemory(Addr(pi_addr_data), 64, false, rootBuf);
+    break;
+  }
+
+  case 9: { // Seed a complete binary tree functionally, via DMA (no CPU
+            // cache touch). pi_data_size holds the depth; same node-
+            // count formula as cmd 8. Array layout: node i's children
+            // live at indices 2i+1, 2i+2.
+    uint64_t depth = pi_data_size;
+    uint64_t total = (1ULL << (depth + 1)) - 1;
+    seedBuffer = new uint8_t[total * sizeof(TreeNode)];
+    TreeNode *nodes = (TreeNode *)seedBuffer;
+    for (uint64_t i = 0; i < total; i++) {
+      nodes[i].payload = i * 100;
+      uint64_t left = 2 * i + 1, right = 2 * i + 2;
+      nodes[i].left_addr =
+          (left < total) ? pi_addr_data + left * sizeof(TreeNode) : 0;
+      nodes[i].right_addr =
+          (right < total) ? pi_addr_data + right * sizeof(TreeNode) : 0;
+    }
+    accessMemory(Addr(pi_addr_data), total * sizeof(TreeNode), true,
+                 seedBuffer);
     break;
   }
 
@@ -107,33 +139,18 @@ void NDPDevA::recvData(Addr addr, uint8_t *data, size_t size) {
 
   switch (pi_cmmd_code) {
   // ---------------------------------------------------------------
-  // CMD 0, 1, 2: Bulk Linear Traversal
+  // CMD 0: Bulk Linear Traversal
   // ---------------------------------------------------------------
-  case 0:
-  case 1:
-  case 2: {
-    // 1. Execute the functional logic instantly on the host
-    if (pi_cmmd_code == 0)
-      compare_n_hit(operands, pi_data_size, pi_data_skey);
-    else if (pi_cmmd_code == 1)
-      compare_n_count(operands, pi_data_size, pi_data_skey);
-    else
-      compare_n_max(operands, pi_data_size);
-
+  case 0: {
+    compare_n_hit(operands, pi_data_size, pi_data_skey);
     delete[] operands;
 
-    // 2. The Analytical Delay Calculation
-    // Tune these parameters to match your target real-life hardware
+    // The Analytical Delay Calculation
     uint64_t elements_per_cycle = 1; // Assuming a scalar 64-bit ALU
     uint64_t pipeline_depth = 15; // Cycles to fill/drain the compute pipeline
-
-    // Calculate how long the hardware would physically take to process the
-    // array
     uint64_t compute_cycles =
         (pi_data_size / elements_per_cycle) + pipeline_depth;
 
-    // 3. Schedule the completion at the mathematically correct time in the
-    // future
     signal_completion(compute_cycles);
     break;
   }
@@ -200,12 +217,49 @@ void NDPDevA::recvData(Addr addr, uint8_t *data, size_t size) {
     break;
   }
 
+  // ---------------------------------------------------------------
+  // CMD 8: Tree Traversal -- each arriving node spawns reads for its
+  // (up to) two children, then frees its own scratch buffer. Natural
+  // termination: a complete tree issues exactly treeTarget reads total.
+  // ---------------------------------------------------------------
+  case 8: {
+    TreeNode *node = (TreeNode *)data;
+    treeVisited++;
+
+    if (node->left_addr != 0) {
+      uint8_t *leftBuf = new uint8_t[64];
+      accessMemory(Addr(node->left_addr), 64, false, leftBuf);
+    }
+    if (node->right_addr != 0) {
+      uint8_t *rightBuf = new uint8_t[64];
+      accessMemory(Addr(node->right_addr), 64, false, rightBuf);
+    }
+
+    delete[] data;
+    pi_last_rslt = treeVisited;
+
+    if (treeVisited == treeTarget) {
+      signal_completion(0);
+    }
+    break;
+  }
+
+  // ---------------------------------------------------------------
+  // CMD 9: Tree-Seeding DMA Write Completion
+  // ---------------------------------------------------------------
+  case 9: {
+    delete[] seedBuffer;
+    seedBuffer = nullptr;
+    signal_completion(0);
+    break;
+  }
+
   default:
     panic("Invalid command in recvData!\n");
   }
 }
 
-// --- Legacy Implementations ---
+// --- Legacy Implementation ---
 uint64_t NDPDevA::compare_n_hit(uint64_t *data, uint64_t size, uint64_t skey) {
   for (uint64_t i = 0; i < size; ++i) {
     if (data[i] == skey) {
@@ -214,27 +268,6 @@ uint64_t NDPDevA::compare_n_hit(uint64_t *data, uint64_t size, uint64_t skey) {
     }
   }
   pi_last_rslt = size;
-  return size;
-}
-
-uint64_t NDPDevA::compare_n_count(uint64_t *data, uint64_t size,
-                                  uint64_t skey) {
-  uint64_t n = 0;
-  for (uint64_t i = 0; i < size; ++i) {
-    if (data[i] == skey)
-      n++;
-  }
-  pi_last_rslt = n;
-  return size;
-}
-
-uint64_t NDPDevA::compare_n_max(uint64_t *data, uint64_t size) {
-  uint64_t max = data[0];
-  for (uint64_t i = 1; i < size; ++i) {
-    if (data[i] > max)
-      max = data[i];
-  }
-  pi_last_rslt = max;
   return size;
 }
 } // namespace gem5
